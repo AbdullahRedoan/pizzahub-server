@@ -1,7 +1,6 @@
 import { Router } from "express";
 import Stripe from "stripe";
 import { ObjectId } from "mongodb";
-import { findUserByIdentifier } from "../middleware/auth.js";
 
 const PREMIUM_PRODUCT_NAME = "PizzaHub Vendor Premium Plan";
 const DEFAULT_PRICE_USD = 29;
@@ -14,10 +13,152 @@ function premiumPriceCents() {
     : DEFAULT_PRICE_USD * 100;
 }
 
-function vendorIdFilter(vendorId) {
-  const values = [vendorId];
-  if (ObjectId.isValid(vendorId)) values.push(new ObjectId(vendorId));
-  return { vendorId: { $in: values } };
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function identifierConditions(identifier) {
+  if (!identifier) return [];
+  const value = String(identifier);
+  const conditions = [{ _id: value }];
+  if (ObjectId.isValid(value)) conditions.push({ _id: new ObjectId(value) });
+  conditions.push({ email: value });
+  return conditions;
+}
+
+function emailConditions(email) {
+  const value = String(email || "").trim();
+  if (!value) return [];
+  return [
+    { email: value },
+    { email: { $regex: `^${escapeRegex(value)}$`, $options: "i" } },
+  ];
+}
+
+function menuItemFilter(vendorId, vendorEmail) {
+  const conditions = [];
+  const id = String(vendorId || "").trim();
+
+  if (id) {
+    conditions.push({ vendorId: id });
+    if (ObjectId.isValid(id)) conditions.push({ vendorId: new ObjectId(id) });
+  }
+
+  const email = String(vendorEmail || "").trim();
+  if (email) {
+    conditions.push({ vendorEmail: email });
+    conditions.push({
+      vendorEmail: { $regex: `^${escapeRegex(email)}$`, $options: "i" },
+    });
+  }
+
+  return conditions.length
+    ? { $or: conditions }
+    : { vendorId: "__no_matching_vendor__" };
+}
+
+async function findVendor(users, vendorId, vendorEmail) {
+  const conditions = [
+    ...identifierConditions(vendorId),
+    ...emailConditions(vendorEmail),
+  ];
+
+  if (!conditions.length) return null;
+  return users.findOne({ $or: conditions });
+}
+
+/**
+ * The single idempotent upgrade path used by BOTH the Stripe webhook and the
+ * protected confirm-session endpoint. The transaction keyed by
+ * stripeSessionId is the guard: once it exists, the session is already applied.
+ */
+export async function upgradeVendorForSession(db, session) {
+  const users = db.collection("user");
+  const menuItems = db.collection("menuItems");
+  const transactions = db.collection("transactions");
+
+  const vendorId = session?.metadata?.vendorId;
+  const vendorEmail =
+    session?.customer_details?.email || session?.metadata?.vendorEmail || "";
+
+  if (!session?.id) {
+    return { upgraded: false, alreadyProcessed: false, vendorId, vendorEmail };
+  }
+
+  const alreadyProcessed = Boolean(
+    await transactions.findOne({ stripeSessionId: session.id }),
+  );
+
+  const vendor = await findVendor(users, vendorId, vendorEmail);
+  const resolvedVendorId = vendor?._id ?? vendorId;
+  const resolvedVendorEmail = vendor?.email || vendorEmail;
+
+  // Menu items can still be tagged when the user lookup misses, as long as the
+  // session gave us an id or email to match against.
+  await menuItems.updateMany(
+    menuItemFilter(resolvedVendorId, resolvedVendorEmail),
+    { $set: { vendorPremium: true } },
+  );
+
+  if (!vendor) {
+    console.warn(
+      `[Stripe Webhook] No vendor found for session ${session.id} ` +
+        `(vendorId=${vendorId || "none"}, vendorEmail=${vendorEmail || "none"})`,
+    );
+    return { upgraded: false, alreadyProcessed: false, vendorId, vendorEmail };
+  }
+
+  // Re-applying the $set is harmless and repairs any partial prior attempt.
+  await users.updateOne(
+    { _id: vendor._id },
+    {
+      $set: {
+        subscriptionPlan: "premium",
+        subscriptionExpiresAt: new Date(Date.now() + ONE_YEAR_MS),
+      },
+    },
+  );
+
+  if (alreadyProcessed) {
+    console.log(
+      `[Stripe Webhook] Session ${session.id} already recorded; premium plan re-checked for ${resolvedVendorEmail || resolvedVendorId}`,
+    );
+    return {
+      upgraded: true,
+      alreadyProcessed: true,
+      vendorId: resolvedVendorId,
+      vendorEmail: resolvedVendorEmail,
+    };
+  }
+
+  const transactionWrite = await transactions.updateOne(
+    { stripeSessionId: session.id },
+    {
+      $setOnInsert: {
+        vendorId: String(resolvedVendorId),
+        vendorEmail: resolvedVendorEmail,
+        vendorName: session.metadata?.vendorName || "",
+        plan: "premium",
+        amount: (session.amount_total || 2900) / 100,
+        currency: (session.currency || "usd").toUpperCase(),
+        stripeSessionId: session.id,
+        status: "succeeded",
+        createdAt: new Date(),
+      },
+    },
+    { upsert: true },
+  );
+
+  console.log(
+    `[Stripe Webhook] Upgraded vendor ${resolvedVendorEmail || resolvedVendorId} to premium`,
+  );
+
+  return {
+    upgraded: true,
+    alreadyProcessed: transactionWrite.upsertedCount === 0,
+    vendorId: resolvedVendorId,
+    vendorEmail: resolvedVendorEmail,
+  };
 }
 
 /** Checkout session creation for vendors upgrading to Premium. */
@@ -78,10 +219,6 @@ export function stripeRoutes(db, auth) {
  * before express.json() so the signature is verified against the exact bytes.
  */
 export function stripeWebhookHandler(db) {
-  const users = db.collection("user");
-  const menuItems = db.collection("menuItems");
-  const transactions = db.collection("transactions");
-
   return async (req, res) => {
     const sig = req.headers["stripe-signature"];
 
@@ -103,45 +240,11 @@ export function stripeWebhookHandler(db) {
     }
 
     if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
-      const vendorId = session.metadata?.vendorId;
-
-      if (vendorId) {
-        const alreadyProcessed = await transactions.findOne({
-          stripeSessionId: session.id,
-        });
-
-        if (!alreadyProcessed) {
-          const vendor = await findUserByIdentifier(users, vendorId);
-          const subscriptionExpiresAt = new Date(Date.now() + ONE_YEAR_MS);
-
-          if (vendor) {
-            await users.updateOne(
-              { _id: vendor._id },
-              {
-                $set: {
-                  subscriptionPlan: "premium",
-                  subscriptionExpiresAt,
-                },
-              },
-            );
-          }
-
-          await menuItems.updateMany(vendorIdFilter(vendorId), {
-            $set: { vendorPremium: true },
-          });
-
-          await transactions.insertOne({
-            vendorId,
-            vendorName: session.metadata?.vendorName || "",
-            plan: "premium",
-            amount: (session.amount_total || 2900) / 100,
-            currency: (session.currency || "usd").toUpperCase(),
-            stripeSessionId: session.id,
-            status: "succeeded",
-            createdAt: new Date(),
-          });
-        }
+      try {
+        await upgradeVendorForSession(db, event.data.object);
+      } catch (error) {
+        console.error("[Stripe Webhook] Could not apply premium upgrade", error);
+        return res.status(500).json({ message: "Could not apply upgrade" });
       }
     }
 
