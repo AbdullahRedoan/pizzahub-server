@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { ObjectId } from "mongodb";
 import { findUserByIdentifier } from "../middleware/auth.js";
+import { checkFreePlanLimit } from "../utils/subscription.js";
 
 const VALID_ROLES = ["customer", "vendor", "admin"];
 const VALID_STATUSES = ["approved", "rejected", "pending"];
@@ -129,7 +130,21 @@ export function adminRoutes(db, auth) {
       return res.status(404).json({ message: "Menu item not found" });
     }
 
-    const active = status === "approved";
+    const vendor =
+      (await findUserByIdentifier(users, String(item.vendorId || ""))) ||
+      (item.vendorEmail
+        ? await findUserByIdentifier(users, item.vendorEmail)
+        : null);
+
+    const { allowed } = await checkFreePlanLimit(menuItems, {
+      vendorId: item.vendorId,
+      vendorEmail: vendor?.email || item.vendorEmail,
+      plan: vendor?.subscriptionPlan || "free",
+      excludeId: item._id,
+    });
+
+    // Approval never bypasses the vendor's Free-plan cap.
+    const active = status === "approved" && allowed;
     await menuItems.updateOne(
       { _id: item._id },
       { $set: { status, active, updatedAt: new Date() } },
@@ -150,6 +165,8 @@ export function adminRoutes(db, auth) {
     return res.json({ message: "Menu item deleted by admin" });
   });
 
+  // Read-only ledger: transactions are written exclusively by Stripe webhooks.
+  // Intentionally no PATCH/PUT/DELETE handler for this resource.
   router.get("/transactions", async (req, res) => {
     const result = await transactions.find({}).sort({ createdAt: -1 }).toArray();
     return res.json({ transactions: result });
