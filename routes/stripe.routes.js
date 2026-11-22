@@ -1,6 +1,10 @@
 import { Router } from "express";
 import Stripe from "stripe";
 import { ObjectId } from "mongodb";
+import {
+  menuItemOwnerFilter,
+  trimActiveItemsToFreeLimit,
+} from "../utils/subscription.js";
 
 const PREMIUM_PRODUCT_NAME = "PizzaHub Vendor Premium Plan";
 const PREMIUM_PRICE_CENTS = 2900;
@@ -25,28 +29,6 @@ function emailConditions(email) {
     { email: value },
     { email: { $regex: `^${escapeRegex(value)}$`, $options: "i" } },
   ];
-}
-
-function menuItemFilter(vendorId, vendorEmail) {
-  const conditions = [];
-  const id = String(vendorId || "").trim();
-
-  if (id) {
-    conditions.push({ vendorId: id });
-    if (ObjectId.isValid(id)) conditions.push({ vendorId: new ObjectId(id) });
-  }
-
-  const email = String(vendorEmail || "").trim();
-  if (email) {
-    conditions.push({ vendorEmail: email });
-    conditions.push({
-      vendorEmail: { $regex: `^${escapeRegex(email)}$`, $options: "i" },
-    });
-  }
-
-  return conditions.length
-    ? { $or: conditions }
-    : { vendorId: "__no_matching_vendor__" };
 }
 
 async function findVendor(users, vendorId, vendorEmail) {
@@ -85,7 +67,7 @@ export async function upgradeVendorForSession(db, session) {
   const resolvedVendorEmail = vendor?.email || vendorEmail;
 
   await menuItems.updateMany(
-    menuItemFilter(resolvedVendorId, resolvedVendorEmail),
+    menuItemOwnerFilter(resolvedVendorId, resolvedVendorEmail),
     { $set: { vendorPremium: true, updatedAt: new Date() } },
   );
 
@@ -150,6 +132,68 @@ export async function upgradeVendorForSession(db, session) {
     vendorId: resolvedVendorId,
     vendorEmail: resolvedVendorEmail,
   };
+}
+
+async function findVendorByStripeIdentifiers(users, stripeObject) {
+  const ids = [
+    stripeObject?.metadata?.vendorId,
+    stripeObject?.subscription,
+    stripeObject?.id,
+    stripeObject?.customer,
+  ]
+    .filter(Boolean)
+    .map(String);
+
+  const conditions = [];
+  for (const id of ids) {
+    conditions.push({ stripeSubscriptionId: id });
+    conditions.push({ stripeCustomerId: id });
+    conditions.push(...identifierConditions(id));
+  }
+
+  const email =
+    stripeObject?.metadata?.vendorEmail ||
+    stripeObject?.customer_email ||
+    stripeObject?.customer_details?.email;
+  conditions.push(...emailConditions(email));
+
+  if (!conditions.length) return null;
+  return users.findOne({ $or: conditions });
+}
+
+/** Cancellation / failed renewal returns the vendor to the Free plan. */
+async function downgradeVendorForStripeObject(db, stripeObject, reason) {
+  const users = db.collection("user");
+  const menuItems = db.collection("menuItems");
+  const vendor = await findVendorByStripeIdentifiers(users, stripeObject);
+
+  if (!vendor) {
+    console.warn(
+      `[Stripe Webhook] No vendor found to downgrade for ${reason} ` +
+        `(subscription=${stripeObject?.subscription || stripeObject?.id || "none"})`,
+    );
+    return { downgraded: false, deactivated: 0 };
+  }
+
+  const ownerFilter = menuItemOwnerFilter(vendor._id, vendor.email);
+
+  await users.updateOne(
+    { _id: vendor._id },
+    { $set: { subscriptionPlan: "free", updatedAt: new Date() } },
+  );
+
+  await menuItems.updateMany(
+    ownerFilter,
+    { $set: { vendorPremium: false, updatedAt: new Date() } },
+  );
+
+  const deactivated = await trimActiveItemsToFreeLimit(menuItems, ownerFilter);
+
+  console.log(
+    `[Stripe Webhook] Downgraded vendor ${vendor.email || vendor._id} to free after ${reason}; deactivated ${deactivated} excess item(s)`,
+  );
+
+  return { downgraded: true, deactivated };
 }
 
 /** Checkout session creation for vendors upgrading to Premium. */
@@ -248,6 +292,18 @@ export function stripeWebhookHandler(db) {
       } catch (error) {
         console.error("[Stripe Webhook] Could not apply premium upgrade", error);
         return res.status(500).json({ message: "Could not apply upgrade" });
+      }
+    }
+
+    if (
+      event.type === "customer.subscription.deleted" ||
+      event.type === "invoice.payment_failed"
+    ) {
+      try {
+        await downgradeVendorForStripeObject(db, event.data.object, event.type);
+      } catch (error) {
+        console.error("[Stripe Webhook] Could not downgrade vendor", error);
+        return res.status(500).json({ message: "Could not apply downgrade" });
       }
     }
 
