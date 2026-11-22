@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { ObjectId } from "mongodb";
 
-const DEFAULT_SORT = { vendorPremium: -1, createdAt: -1 };
+const PREMIUM_FIRST_SORT = { vendorPremium: -1, createdAt: -1 };
 const FEATURED_LIMIT = 6;
 const UPDATABLE_FIELDS = [
   "itemName",
@@ -17,10 +17,11 @@ function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// Premium kitchens always lead, including featured and price-sorted browsing.
 function sortFor(sort) {
-  if (sort === "asc") return { price: 1 };
-  if (sort === "desc") return { price: -1 };
-  return DEFAULT_SORT;
+  if (sort === "asc") return { vendorPremium: -1, price: 1 };
+  if (sort === "desc") return { vendorPremium: -1, price: -1 };
+  return PREMIUM_FIRST_SORT;
 }
 
 function findItemById(items, id) {
