@@ -80,17 +80,20 @@ export async function upgradeVendorForSession(db, session) {
   }
 
   // Re-applying the $set is harmless and repairs any partial prior attempt.
-  await users.updateOne(
-    { _id: vendor._id },
-    {
-      $set: {
-        subscriptionPlan: "premium",
-        stripeCustomerId: session.customer || null,
-        stripeSubscriptionId: session.subscription || null,
-        updatedAt: new Date(),
-      },
-    },
-  );
+  const expiresAt = new Date();
+  expiresAt.setMonth(expiresAt.getMonth() + 1);
+
+  const premiumUpdate = {
+    subscriptionPlan: "premium",
+    stripeCustomerId: session.customer || null,
+    stripeSubscriptionId: session.subscription || null,
+    updatedAt: new Date(),
+  };
+  if (!alreadyProcessed || !vendor.subscriptionExpiresAt) {
+    premiumUpdate.subscriptionExpiresAt = expiresAt;
+  }
+
+  await users.updateOne({ _id: vendor._id }, { $set: premiumUpdate });
 
   if (alreadyProcessed) {
     console.log(
@@ -179,7 +182,10 @@ async function downgradeVendorForStripeObject(db, stripeObject, reason) {
 
   await users.updateOne(
     { _id: vendor._id },
-    { $set: { subscriptionPlan: "free", updatedAt: new Date() } },
+    {
+      $set: { subscriptionPlan: "free", updatedAt: new Date() },
+      $unset: { subscriptionExpiresAt: "" },
+    },
   );
 
   await menuItems.updateMany(

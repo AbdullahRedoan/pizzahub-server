@@ -69,3 +69,5 @@ app.get("/users", async (req, res) => {
 app.listen(port, () => {
   console.log(`PizzaHub is running on port: ${port}`);
 });
+
+export default app;

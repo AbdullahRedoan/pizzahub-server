@@ -72,6 +72,19 @@ export function createAuthMiddleware(db) {
           .json({ message: "Forbidden: account is blocked" });
       }
 
+      if (
+        String(user.subscriptionPlan || "").toLowerCase() === "premium" &&
+        !user.subscriptionExpiresAt
+      ) {
+        const expiresAt = new Date(user.updatedAt || user.createdAt || Date.now());
+        expiresAt.setMonth(expiresAt.getMonth() + 1);
+        await users.updateOne(
+          { _id: user._id },
+          { $set: { subscriptionExpiresAt: expiresAt } },
+        );
+        user.subscriptionExpiresAt = expiresAt;
+      }
+
       req.user = toPublicUser(user);
       return next();
     } catch {

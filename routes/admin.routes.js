@@ -4,7 +4,7 @@ import { findUserByIdentifier } from "../middleware/auth.js";
 import { checkFreePlanLimit } from "../utils/subscription.js";
 
 const VALID_ROLES = ["customer", "vendor", "admin"];
-const VALID_STATUSES = ["approved", "rejected", "pending"];
+const VALID_STATUSES = ["approved", "rejected", "pending", "inactive"];
 
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
