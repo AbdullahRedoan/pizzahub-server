@@ -1,5 +1,11 @@
 import { Router } from "express";
 import { ObjectId } from "mongodb";
+import {
+  FREE_PLAN_LIMIT_CODE,
+  FREE_PLAN_LIMIT_MESSAGE,
+  checkFreePlanLimit,
+  isPremiumPlan,
+} from "../utils/subscription.js";
 
 const PREMIUM_FIRST_SORT = { vendorPremium: -1, createdAt: -1 };
 const FEATURED_LIMIT = 6;
@@ -118,6 +124,19 @@ export function vendorMenuRoutes(db, auth) {
       return res.status(400).json({ message: "Price must be a positive number" });
     }
 
+    const { allowed } = await checkFreePlanLimit(items, {
+      vendorId: req.user.id,
+      vendorEmail: req.user.email,
+      plan: req.user.subscriptionPlan,
+    });
+
+    if (!allowed) {
+      return res.status(403).json({
+        code: FREE_PLAN_LIMIT_CODE,
+        message: FREE_PLAN_LIMIT_MESSAGE,
+      });
+    }
+
     const now = new Date();
     const item = {
       itemName,
@@ -128,7 +147,7 @@ export function vendorMenuRoutes(db, auth) {
       images,
       vendorId: req.user.id,
       vendorName: req.user.businessName || req.user.name,
-      vendorPremium: req.user.subscriptionPlan === "premium",
+      vendorPremium: isPremiumPlan(req.user.subscriptionPlan),
       status: "pending",
       active: false,
       createdAt: now,
