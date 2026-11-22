@@ -4,7 +4,6 @@ import { ObjectId } from "mongodb";
 
 const PREMIUM_PRODUCT_NAME = "PizzaHub Vendor Premium Plan";
 const PREMIUM_PRICE_CENTS = 2900;
-const ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000;
 
 function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -61,9 +60,8 @@ async function findVendor(users, vendorId, vendorEmail) {
 }
 
 /**
- * The single idempotent upgrade path used by BOTH the Stripe webhook and the
- * protected confirm-session endpoint. The transaction keyed by
- * stripeSessionId is the guard: once it exists, the session is already applied.
+ * Premium is activated ONLY here, from a verified Stripe webhook event.
+ * The transaction keyed by stripeSessionId is the idempotency guard.
  */
 export async function upgradeVendorForSession(db, session) {
   const users = db.collection("user");
@@ -72,7 +70,7 @@ export async function upgradeVendorForSession(db, session) {
 
   const vendorId = session?.metadata?.vendorId;
   const vendorEmail =
-    session?.customer_details?.email || session?.metadata?.vendorEmail || "";
+    session?.metadata?.vendorEmail || session?.customer_details?.email || "";
 
   if (!session?.id) {
     return { upgraded: false, alreadyProcessed: false, vendorId, vendorEmail };
@@ -86,11 +84,9 @@ export async function upgradeVendorForSession(db, session) {
   const resolvedVendorId = vendor?._id ?? vendorId;
   const resolvedVendorEmail = vendor?.email || vendorEmail;
 
-  // Menu items can still be tagged when the user lookup misses, as long as the
-  // session gave us an id or email to match against.
   await menuItems.updateMany(
     menuItemFilter(resolvedVendorId, resolvedVendorEmail),
-    { $set: { vendorPremium: true } },
+    { $set: { vendorPremium: true, updatedAt: new Date() } },
   );
 
   if (!vendor) {
@@ -107,7 +103,9 @@ export async function upgradeVendorForSession(db, session) {
     {
       $set: {
         subscriptionPlan: "premium",
-        subscriptionExpiresAt: new Date(Date.now() + ONE_YEAR_MS),
+        stripeCustomerId: session.customer || null,
+        stripeSubscriptionId: session.subscription || null,
+        updatedAt: new Date(),
       },
     },
   );
@@ -129,13 +127,13 @@ export async function upgradeVendorForSession(db, session) {
     {
       $setOnInsert: {
         vendorId: String(resolvedVendorId),
+        vendorName: vendor.businessName || vendor.name || "",
         vendorEmail: resolvedVendorEmail,
-        vendorName: session.metadata?.vendorName || "",
-        plan: "premium",
-        amount: (session.amount_total || 2900) / 100,
+        plan: "Premium",
+        amount: (session.amount_total || PREMIUM_PRICE_CENTS) / 100,
         currency: (session.currency || "usd").toUpperCase(),
-        stripeSessionId: session.id,
         status: "succeeded",
+        stripeSessionId: session.id,
         createdAt: new Date(),
       },
     },
@@ -236,8 +234,17 @@ export function stripeWebhookHandler(db) {
     }
 
     if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+
+      if (session.payment_status !== "paid") {
+        console.warn(
+          `[Stripe Webhook] Ignoring unpaid checkout session ${session.id}`,
+        );
+        return res.json({ received: true });
+      }
+
       try {
-        await upgradeVendorForSession(db, event.data.object);
+        await upgradeVendorForSession(db, session);
       } catch (error) {
         console.error("[Stripe Webhook] Could not apply premium upgrade", error);
         return res.status(500).json({ message: "Could not apply upgrade" });
