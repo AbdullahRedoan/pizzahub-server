@@ -178,20 +178,19 @@ export function vendorMenuRoutes(db, auth) {
         return res.status(403).json({ message: "Forbidden" });
       }
 
-      if (req.body?.active === true) {
-        if (req.user.subscriptionPlan !== "premium") {
-          const activeCount = await items.countDocuments({
-            vendorId: req.user.id,
-            active: true,
-            _id: { $ne: objectId },
-          });
+      if (req.body?.active === true && item.active !== true) {
+        const { allowed } = await checkFreePlanLimit(items, {
+          vendorId: req.user.id,
+          vendorEmail: req.user.email,
+          plan: req.user.subscriptionPlan,
+          excludeId: objectId,
+        });
 
-          if (activeCount >= 3) {
-            return res.status(403).json({
-              message:
-                "Free plan allows maximum 3 active menu items. Upgrade to Premium for unlimited items.",
-            });
-          }
+        if (!allowed) {
+          return res.status(403).json({
+            code: FREE_PLAN_LIMIT_CODE,
+            message: FREE_PLAN_LIMIT_MESSAGE,
+          });
         }
 
         if (item.status !== "approved") {
