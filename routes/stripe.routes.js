@@ -3,15 +3,8 @@ import Stripe from "stripe";
 import { ObjectId } from "mongodb";
 
 const PREMIUM_PRODUCT_NAME = "PizzaHub Vendor Premium Plan";
-const DEFAULT_PRICE_USD = 29;
+const PREMIUM_PRICE_CENTS = 2900;
 const ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000;
-
-function premiumPriceCents() {
-  const configured = Number(process.env.STRIPE_PREMIUM_PRICE_USD || DEFAULT_PRICE_USD);
-  return Number.isFinite(configured) && configured > 0
-    ? Math.round(configured * 100)
-    : DEFAULT_PRICE_USD * 100;
-}
 
 function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -185,24 +178,27 @@ export function stripeRoutes(db, auth) {
       const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
       const clientUrl = process.env.CLIENT_URL || "http://localhost:3000";
 
+      // Never accept ownership from the request body: only the authenticated
+      // vendor may start a checkout for their own account.
+      const vendorId = String(req.user?._id ?? req.user.id ?? "");
+      const vendorEmail = req.user.email;
+      const billingMetadata = { vendorId, vendorEmail };
+
       const session = await stripe.checkout.sessions.create({
-        mode: "payment",
+        mode: "subscription",
         line_items: [
           {
             price_data: {
               currency: "usd",
-              unit_amount: premiumPriceCents(),
+              unit_amount: PREMIUM_PRICE_CENTS,
+              recurring: { interval: "month" },
               product_data: { name: PREMIUM_PRODUCT_NAME },
             },
             quantity: 1,
           },
         ],
-        metadata: {
-          vendorId: req.user.id,
-          vendorEmail: req.user.email,
-          vendorName: req.user.businessName || req.user.name,
-          plan: "premium",
-        },
+        metadata: billingMetadata,
+        subscription_data: { metadata: billingMetadata },
         success_url: `${clientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${clientUrl}/payment/cancel`,
       });
